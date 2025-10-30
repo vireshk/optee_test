@@ -3,11 +3,15 @@
  * Copyright (c) 2016, Linaro Limited
  */
 
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
+#include <linux/dma-heap.h>
 #include <linux/vm_sockets.h>
 
 #include <assert.h>
 #include <err.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1038,6 +1042,110 @@ ADBG_CASE_DEFINE(regression, 2004, xtest_tee_test_2004,
 		"UDP iSocket API tests");
 
 
+#define SCM_VSOCK_SHMEM 1
+#define SOL_VSOCK 287
+
+#define VSOCK_SHMEM_SUBOP_OFFER		0
+#define VSOCK_SHMEM_SUBOP_RELINQUISH	1
+#define VSOCK_SHMEM_SUBOP_RECLAIM	2
+
+/* SHMEM type */
+#define VSOCK_SHMEM_TYPE_LB		0
+#define VSOCK_SHMEM_TYPE_FFA		1
+
+/* Userspace-visible descriptor transferred as ancillary cmsg payload */
+struct vsock_shmem_user_desc {
+	uint32_t subop; /*VSOCK_SHMEM_SUBOP_* */
+	uint32_t type; /* VSOCK_SHMEM_TYPE_* */
+	int32_t fd;
+};
+
+static int vsock_shmem_fd(size_t size)
+{
+	int heap_fd = open("/dev/dma_heap/system", O_RDWR);
+	if (heap_fd < 0) {
+		perror("open /dev/dma_heap/system");
+		return -1;
+	}
+
+	struct dma_heap_allocation_data alloc = {
+		.len = size,
+		.fd_flags = O_RDWR | O_CLOEXEC,
+	};
+
+	if (ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &alloc) < 0) {
+		perror("DMA_HEAP_IOCTL_ALLOC");
+		close(heap_fd);
+		return -1;
+	}
+
+	close(heap_fd);
+	return alloc.fd;
+}
+
+// Send a file descriptor over a Unix socket
+static int vosck_send_fd(int sock, int fd, int subop)
+{
+	struct vsock_shmem_user_desc udesc;
+	char control[CMSG_SPACE(sizeof(udesc))];
+	memset(control, 0, sizeof(control));
+	char dummy = 'X';
+	struct iovec iov = { .iov_base = &dummy, .iov_len = sizeof(dummy) };
+	struct msghdr msg = {
+		.msg_iov = &iov, .msg_iovlen = 1,
+		.msg_control = control, .msg_controllen = sizeof(control)
+	};
+	struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+
+	udesc.fd = fd;
+	udesc.subop = subop;
+	udesc.type = VSOCK_SHMEM_TYPE_FFA;
+	cmsg->cmsg_level = SOL_VSOCK;
+	cmsg->cmsg_type = SCM_VSOCK_SHMEM;
+	cmsg->cmsg_len = CMSG_LEN(sizeof(udesc));
+	memcpy(CMSG_DATA(cmsg), &udesc, sizeof(udesc));
+
+	if (sendmsg(sock, &msg, 0) < 0) {
+		perror("sendmsg");
+		return -1;
+	}
+	return 0;
+}
+
+static void vsock_send_shmem(int sock)
+{
+	uint64_t MB = 1024 * 1024;
+	uint64_t size = 4 * MB, i;
+	char msg[] = "Hello world!";
+
+	int fd = vsock_shmem_fd(size);
+	if (fd < 0) return;
+
+	char *mem = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (mem == MAP_FAILED) {
+		perror("mmap");
+		close(fd);
+		return;
+	}
+
+	for (i = 0; i < size; i += MB)
+		strcpy(mem + i, msg);
+
+	/* Share the memory */
+	if (vosck_send_fd(sock, fd, VSOCK_SHMEM_SUBOP_OFFER) != 0) {
+		printf("Failed to shared memory\n");
+	}
+
+	sleep(2);
+
+	/* Unshare the memory */
+	if (vosck_send_fd(sock, fd, VSOCK_SHMEM_SUBOP_RECLAIM) != 0) {
+		printf("Failed to unshare memory\n");
+	}
+	munmap(mem, size);
+	close(fd);
+}
+
 static void xtest_tee_test_2005(ADBG_Case_t *c)
 {
 	TEEC_Result res = TEEC_SUCCESS;
@@ -1139,6 +1247,10 @@ static void xtest_tee_test_2005(ADBG_Case_t *c)
 			goto out;
 	}
 	Do_ADBG_EndSubCase(c, "Send/recv vsock");
+
+	Do_ADBG_BeginSubCase(c, "Vsock share memory");
+	vsock_send_shmem(fd);
+	Do_ADBG_EndSubCase(c, "Vsock share memory");
 
 out:
 	ADBG_EXPECT_TEEC_SUCCESS(c, socket_close(&session, &sh, &ret_orig));
